@@ -78,7 +78,7 @@ export interface IUntitledFileWorkingCopyInitialContents {
 	/**
 	 * The initial contents of the untitled file working copy.
 	 */
-	value: VSBufferReadableStream;
+	readonly value: VSBufferReadableStream;
 
 	/**
 	 * If not provided, the untitled file working copy will be marked
@@ -87,7 +87,7 @@ export interface IUntitledFileWorkingCopyInitialContents {
 	 * Note: if the untitled file working copy has an associated path
 	 * the dirty state will always be set.
 	 */
-	markDirty?: boolean;
+	readonly markDirty?: boolean;
 }
 
 export class UntitledFileWorkingCopy<M extends IUntitledFileWorkingCopyModel> extends Disposable implements IUntitledFileWorkingCopy<M>  {
@@ -190,7 +190,7 @@ export class UntitledFileWorkingCopy<M extends IUntitledFileWorkingCopyModel> ex
 		this.setDirty(this.hasAssociatedFilePath || !!backup || Boolean(this.initialContents && this.initialContents.markDirty !== false));
 
 		// If we have initial contents, make sure to emit this
-		// as the appropiate events to the outside.
+		// as the appropriate events to the outside.
 		if (!!backup || this.initialContents) {
 			this._onDidChangeContent.fire();
 		}
@@ -243,11 +243,16 @@ export class UntitledFileWorkingCopy<M extends IUntitledFileWorkingCopyModel> ex
 	//#region Backup
 
 	async backup(token: CancellationToken): Promise<IWorkingCopyBackup> {
-
-		// Fill in content if we are resolved
 		let content: VSBufferReadableStream | undefined = undefined;
+
+		// Make sure to check whether this working copy has been
+		// resolved or not and fallback to the initial value -
+		// if any - to prevent backing up an unresolved working
+		// copy and loosing the initial value.
 		if (this.isResolved()) {
 			content = await raceCancellation(this.model.snapshot(token), token);
+		} else if (this.initialContents) {
+			content = this.initialContents.value;
 		}
 
 		return { content };

@@ -23,7 +23,7 @@ import { ElementsDragAndDropData } from 'vs/base/browser/ui/list/listView';
 import { FuzzyScore } from 'vs/base/common/filters';
 import { IHighlight } from 'vs/base/browser/ui/highlightedlabel/highlightedLabel';
 import { VariablesRenderer } from 'vs/workbench/contrib/debug/browser/variablesView';
-import { IContextKeyService, ContextKeyEqualsExpr, IContextKey } from 'vs/platform/contextkey/common/contextkey';
+import { IContextKeyService, ContextKeyExpr, IContextKey } from 'vs/platform/contextkey/common/contextkey';
 import { dispose } from 'vs/base/common/lifecycle';
 import { IViewDescriptorService } from 'vs/workbench/common/views';
 import { IOpenerService } from 'vs/platform/opener/common/opener';
@@ -166,6 +166,13 @@ export class WatchExpressionsView extends ViewPane {
 				horizontalScrolling = undefined;
 			}
 		}));
+
+		this._register(this.debugService.getViewModel().onDidEvaluateLazyExpression(async e => {
+			if (e instanceof Variable && this.tree.hasNode(e)) {
+				await this.tree.updateChildren(e, false, true);
+				await this.tree.expand(e);
+			}
+		}));
 	}
 
 	override layoutBody(height: number, width: number): void {
@@ -204,9 +211,9 @@ export class WatchExpressionsView extends ViewPane {
 
 		this.watchItemType.set(element instanceof Expression ? 'expression' : element instanceof Variable ? 'variable' : undefined);
 		const actions: IAction[] = [];
-		const actionsDisposable = createAndFillInContextMenuActions(this.menu, { arg: element, shouldForwardArgs: true }, actions);
 		const attributes = element instanceof Variable ? element.presentationHint?.attributes : undefined;
-		this.variableReadonly.set(!!attributes && attributes.indexOf('readOnly') >= 0);
+		this.variableReadonly.set(!!attributes && attributes.indexOf('readOnly') >= 0 || !!element?.presentationHint?.lazy);
+		const actionsDisposable = createAndFillInContextMenuActions(this.menu, { arg: element, shouldForwardArgs: true }, actions);
 		this.contextMenuService.showContextMenu({
 			getAnchor: () => e.anchor,
 			getActions: () => actions,
@@ -381,7 +388,7 @@ registerAction2(class Collapse extends ViewAction<WatchExpressionsView> {
 				id: MenuId.ViewTitle,
 				order: 30,
 				group: 'navigation',
-				when: ContextKeyEqualsExpr.create('view', WATCH_VIEW_ID)
+				when: ContextKeyExpr.equals('view', WATCH_VIEW_ID)
 			}
 		});
 	}
@@ -404,7 +411,7 @@ registerAction2(class AddWatchExpressionAction extends Action2 {
 			menu: {
 				id: MenuId.ViewTitle,
 				group: 'navigation',
-				when: ContextKeyEqualsExpr.create('view', WATCH_VIEW_ID)
+				when: ContextKeyExpr.equals('view', WATCH_VIEW_ID)
 			}
 		});
 	}
@@ -429,7 +436,7 @@ registerAction2(class RemoveAllWatchExpressionsAction extends Action2 {
 				id: MenuId.ViewTitle,
 				order: 20,
 				group: 'navigation',
-				when: ContextKeyEqualsExpr.create('view', WATCH_VIEW_ID)
+				when: ContextKeyExpr.equals('view', WATCH_VIEW_ID)
 			}
 		});
 	}

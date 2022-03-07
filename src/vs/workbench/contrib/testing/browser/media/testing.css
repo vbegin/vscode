@@ -146,6 +146,10 @@
 	margin-bottom: 0;
 }
 
+.monaco-editor .zone-widget.test-output-peek .preview-text a {
+	cursor: pointer;
+}
+
 /** -- filter  */
 .testing-filter-action-bar {
 	flex-shrink: 0;
@@ -191,14 +195,6 @@
 	cursor: pointer;
 }
 
-.monaco-editor .testing-inline-message-content {
-	cursor: pointer;
-}
-
-.monaco-editor .testing-inline-message-line {
-	background: red;
-}
-
 .testing-diff-title-widget {
 	line-height: 19px;
 	font-size: 12px;
@@ -208,4 +204,13 @@
 	display: inline-block;
 	text-overflow: ellipsis;
 	white-space: nowrap;
+}
+
+.test-message-inline-content {
+	font-family: var(--testMessageDecorationFontFamily);
+	font-size: var(--testMessageDecorationFontSize);
+}
+
+.test-message-inline-content-clickable {
+	cursor: pointer;
 }

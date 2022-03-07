@@ -8,7 +8,7 @@ import { Event, Emitter } from 'vs/base/common/event';
 import * as objects from 'vs/base/common/objects';
 import { Action } from 'vs/base/common/actions';
 import * as errors from 'vs/base/common/errors';
-import { ICustomEndpointTelemetryService, ITelemetryService } from 'vs/platform/telemetry/common/telemetry';
+import { createErrorWithActions } from 'vs/base/common/errorMessage';
 import { formatPII, isUri } from 'vs/workbench/contrib/debug/common/debugUtils';
 import { IDebugAdapter, IConfig, AdapterEndEvent, IDebugger } from 'vs/workbench/contrib/debug/common/debug';
 import { IExtensionHostDebugService, IOpenExtensionWindowResult } from 'vs/platform/debug/common/extensionHostDebug';
@@ -33,7 +33,7 @@ interface ILaunchVSCodeArgument {
 interface ILaunchVSCodeArguments {
 	args: ILaunchVSCodeArgument[];
 	debugRenderer?: boolean;
-	env?: { [key: string]: string | null; };
+	env?: { [key: string]: string | null };
 }
 
 /**
@@ -69,6 +69,7 @@ export class RawDebugSession implements IDisposable {
 	private readonly _onDidProgressUpdate = new Emitter<DebugProtocol.ProgressUpdateEvent>();
 	private readonly _onDidProgressEnd = new Emitter<DebugProtocol.ProgressEndEvent>();
 	private readonly _onDidInvalidated = new Emitter<DebugProtocol.InvalidatedEvent>();
+	private readonly _onDidInvalidateMemory = new Emitter<DebugProtocol.MemoryEvent>();
 	private readonly _onDidCustomEvent = new Emitter<DebugProtocol.Event>();
 	private readonly _onDidEvent = new Emitter<DebugProtocol.Event>();
 
@@ -82,8 +83,6 @@ export class RawDebugSession implements IDisposable {
 		debugAdapter: IDebugAdapter,
 		public readonly dbgr: IDebugger,
 		private readonly sessionId: string,
-		@ITelemetryService private readonly telemetryService: ITelemetryService,
-		@ICustomEndpointTelemetryService private readonly customTelemetryService: ICustomEndpointTelemetryService,
 		@IExtensionHostDebugService private readonly extensionHostDebugService: IExtensionHostDebugService,
 		@IOpenerService private readonly openerService: IOpenerService,
 		@INotificationService private readonly notificationService: INotificationService,
@@ -154,6 +153,9 @@ export class RawDebugSession implements IDisposable {
 					break;
 				case 'invalidated':
 					this._onDidInvalidated.fire(event as DebugProtocol.InvalidatedEvent);
+					break;
+				case 'memory':
+					this._onDidInvalidateMemory.fire(event as DebugProtocol.MemoryEvent);
 					break;
 				case 'process':
 					break;
@@ -243,6 +245,10 @@ export class RawDebugSession implements IDisposable {
 		return this._onDidInvalidated.event;
 	}
 
+	get onDidInvalidateMemory(): Event<DebugProtocol.MemoryEvent> {
+		return this._onDidInvalidateMemory.event;
+	}
+
 	get onDidEvent(): Event<DebugProtocol.Event> {
 		return this._onDidEvent.event;
 	}
@@ -265,7 +271,7 @@ export class RawDebugSession implements IDisposable {
 	 * Send client capabilities to the debug adapter and receive DA capabilities in return.
 	 */
 	async initialize(args: DebugProtocol.InitializeRequestArguments): Promise<DebugProtocol.InitializeResponse | undefined> {
-		const response = await this.send('initialize', args);
+		const response = await this.send('initialize', args, undefined, undefined, false);
 		if (response) {
 			this.mergeCapabilities(response.body);
 		}
@@ -284,7 +290,7 @@ export class RawDebugSession implements IDisposable {
 	//---- DAP requests
 
 	async launchOrAttach(config: IConfig): Promise<DebugProtocol.Response | undefined> {
-		const response = await this.send(config.request, config);
+		const response = await this.send(config.request, config, undefined, undefined, false);
 		if (response) {
 			this.mergeCapabilities(response.body);
 		}
@@ -521,6 +527,22 @@ export class RawDebugSession implements IDisposable {
 		return Promise.reject(new Error('disassemble is not supported'));
 	}
 
+	async readMemory(args: DebugProtocol.ReadMemoryArguments): Promise<DebugProtocol.ReadMemoryResponse | undefined> {
+		if (this.capabilities.supportsReadMemoryRequest) {
+			return await this.send('readMemory', args);
+		}
+
+		return Promise.reject(new Error('readMemory is not supported'));
+	}
+
+	async writeMemory(args: DebugProtocol.WriteMemoryArguments): Promise<DebugProtocol.WriteMemoryResponse | undefined> {
+		if (this.capabilities.supportsWriteMemoryRequest) {
+			return await this.send('writeMemory', args);
+		}
+
+		return Promise.reject(new Error('writeMemory is not supported'));
+	}
+
 	cancel(args: DebugProtocol.CancelArguments): Promise<DebugProtocol.CancelResponse | undefined> {
 		return this.send('cancel', args);
 	}
@@ -641,7 +663,7 @@ export class RawDebugSession implements IDisposable {
 
 		const args: string[] = [];
 
-		for (let arg of vscodeArgs.args) {
+		for (const arg of vscodeArgs.args) {
 			const a2 = (arg.prefix || '') + (arg.path || '');
 			const match = /^--(.+)=(.+)$/.exec(a2);
 			if (match && match.length === 3) {
@@ -649,7 +671,7 @@ export class RawDebugSession implements IDisposable {
 				let value = match[2];
 
 				if ((key === 'file-uri' || key === 'folder-uri') && !isUri(arg.path)) {
-					value = URI.file(value).toString();
+					value = isUri(value) ? value : URI.file(value).toString();
 				}
 				args.push(`--${key}=${value}`);
 			} else {
@@ -657,10 +679,14 @@ export class RawDebugSession implements IDisposable {
 			}
 		}
 
-		return this.extensionHostDebugService.openExtensionDevelopmentHostWindow(args, vscodeArgs.env, !!vscodeArgs.debugRenderer);
+		if (vscodeArgs.env) {
+			args.push(`--extensionEnvironment=${JSON.stringify(vscodeArgs.env)}`);
+		}
+
+		return this.extensionHostDebugService.openExtensionDevelopmentHostWindow(args, !!vscodeArgs.debugRenderer);
 	}
 
-	private send<R extends DebugProtocol.Response>(command: string, args: any, token?: CancellationToken, timeout?: number): Promise<R | undefined> {
+	private send<R extends DebugProtocol.Response>(command: string, args: any, token?: CancellationToken, timeout?: number, showErrors = true): Promise<R | undefined> {
 		return new Promise<DebugProtocol.Response | undefined>((completeDispatch, errorDispatch) => {
 			if (!this.debugAdapter) {
 				if (this.inShutdown) {
@@ -693,10 +719,10 @@ export class RawDebugSession implements IDisposable {
 					}
 				});
 			}
-		}).then(undefined, err => Promise.reject(this.handleErrorResponse(err)));
+		}).then(undefined, err => Promise.reject(this.handleErrorResponse(err, showErrors)));
 	}
 
-	private handleErrorResponse(errorResponse: DebugProtocol.Response): Error {
+	private handleErrorResponse(errorResponse: DebugProtocol.Response, showErrors: boolean): Error {
 
 		if (errorResponse.command === 'canceled' && errorResponse.message === 'canceled') {
 			return errors.canceled();
@@ -705,11 +731,6 @@ export class RawDebugSession implements IDisposable {
 		const error: DebugProtocol.Message | undefined = errorResponse?.body?.error;
 		const errorMessage = errorResponse?.message || '';
 
-		if (error && error.sendTelemetry) {
-			const telemetryMessage = error ? formatPII(error.format, true, error.variables) : errorMessage;
-			this.telemetryDebugProtocolErrorResponse(telemetryMessage);
-		}
-
 		const userMessage = error ? formatPII(error.format, false, error.variables) : errorMessage;
 		const url = error?.url;
 		if (error && url) {
@@ -717,13 +738,13 @@ export class RawDebugSession implements IDisposable {
 			const uri = URI.parse(url);
 			// Use a suffixed id if uri invokes a command, so default 'Open launch.json' command is suppressed on dialog
 			const actionId = uri.scheme === Schemas.command ? 'debug.moreInfo.command' : 'debug.moreInfo';
-			return errors.createErrorWithActions(userMessage, {
+			return createErrorWithActions(userMessage, {
 				actions: [new Action(actionId, label, undefined, true, async () => {
 					this.openerService.open(uri, { allowCommands: true });
 				})]
 			});
 		}
-		if (error && error.format && error.showUser) {
+		if (showErrors && error && error.format && error.showUser) {
 			this.notificationService.error(userMessage);
 		}
 		const result = new Error(userMessage);
@@ -748,23 +769,6 @@ export class RawDebugSession implements IDisposable {
 			},
 			seq: undefined!
 		});
-	}
-
-	private telemetryDebugProtocolErrorResponse(telemetryMessage: string | undefined) {
-		/* __GDPR__
-			"debugProtocolErrorResponse" : {
-				"error" : { "classification": "CallstackOrException", "purpose": "FeatureInsight" }
-			}
-		*/
-		this.telemetryService.publicLogError('debugProtocolErrorResponse', { error: telemetryMessage });
-		const telemetryEndpoint = this.dbgr.getCustomTelemetryEndpoint();
-		if (telemetryEndpoint) {
-			/* __GDPR__TODO__
-				The message is sent in the name of the adapter but the adapter doesn't know about it.
-				However, since adapters are an open-ended set, we can not declared the events statically either.
-			*/
-			this.customTelemetryService.publicLogError(telemetryEndpoint, 'debugProtocolErrorResponse', { error: telemetryMessage });
-		}
 	}
 
 	dispose(): void {

@@ -30,12 +30,16 @@ export interface IHoverService {
 	 * });
 	 * ```
 	 */
-	showHover(options: IHoverOptions, focus?: boolean): IDisposable | undefined;
+	showHover(options: IHoverOptions, focus?: boolean): IHoverWidget | undefined;
 
 	/**
 	 * Hides the hover if it was visible.
 	 */
 	hideHover(): void;
+}
+
+export interface IHoverWidget extends IDisposable {
+	readonly isDisposed: boolean;
 }
 
 export interface IHoverOptions {
@@ -92,7 +96,7 @@ export interface IHoverOptions {
 	 * Force the hover position, reducing the size of the hover instead of adjusting the hover
 	 * position.
 	 */
-	forcePosition?: boolean
+	forcePosition?: boolean;
 
 	/**
 	 * Whether to show the hover pointer

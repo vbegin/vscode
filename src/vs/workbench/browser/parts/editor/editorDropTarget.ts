@@ -4,28 +4,23 @@
  *--------------------------------------------------------------------------------------------*/
 
 import 'vs/css!./media/editordroptarget';
-import { LocalSelectionTransfer, DraggedEditorIdentifier, ResourcesDropHandler, DraggedEditorGroupIdentifier, DragAndDropObserver, containsDragType, CodeDataTransfers } from 'vs/workbench/browser/dnd';
+import { LocalSelectionTransfer, DraggedEditorIdentifier, ResourcesDropHandler, DraggedEditorGroupIdentifier, DragAndDropObserver, containsDragType, CodeDataTransfers, DraggedTreeItemsIdentifier, extractTreeDropData } from 'vs/workbench/browser/dnd';
 import { addDisposableListener, EventType, EventHelper, isAncestor } from 'vs/base/browser/dom';
-import { IEditorGroupsAccessor, IEditorGroupView, getActiveTextEditorOptions } from 'vs/workbench/browser/parts/editor/editor';
+import { IEditorGroupsAccessor, IEditorGroupView, fillActiveEditorViewState } from 'vs/workbench/browser/parts/editor/editor';
 import { EDITOR_DRAG_AND_DROP_BACKGROUND } from 'vs/workbench/common/theme';
 import { IThemeService, Themable } from 'vs/platform/theme/common/themeService';
 import { activeContrastBorder } from 'vs/platform/theme/common/colorRegistry';
-import { IEditorIdentifier, EditorInputCapabilities } from 'vs/workbench/common/editor';
+import { IEditorIdentifier, EditorInputCapabilities, IUntypedEditorInput } from 'vs/workbench/common/editor';
 import { isMacintosh, isWeb } from 'vs/base/common/platform';
-import { GroupDirection, IEditorGroupsService, MergeGroupMode } from 'vs/workbench/services/editor/common/editorGroupsService';
+import { GroupDirection, IEditorGroupsService, IMergeGroupOptions, MergeGroupMode } from 'vs/workbench/services/editor/common/editorGroupsService';
 import { toDisposable } from 'vs/base/common/lifecycle';
 import { IInstantiationService } from 'vs/platform/instantiation/common/instantiation';
 import { RunOnceScheduler } from 'vs/base/common/async';
 import { DataTransfers } from 'vs/base/browser/dnd';
-import { VSBuffer } from 'vs/base/common/buffer';
-import { IDialogService, IFileDialogService } from 'vs/platform/dialogs/common/dialogs';
-import { URI } from 'vs/base/common/uri';
-import { joinPath } from 'vs/base/common/resources';
 import { IEditorService } from 'vs/workbench/services/editor/common/editorService';
 import { assertIsDefined, assertAllDefined } from 'vs/base/common/types';
-import Severity from 'vs/base/common/severity';
-import { localize } from 'vs/nls';
-import { ByteSize } from 'vs/platform/files/common/files';
+import { ITreeViewsService } from 'vs/workbench/services/views/browser/treeViewsService';
+import { isTemporaryWorkspace, IWorkspaceContextService } from 'vs/platform/workspace/common/workspace';
 
 interface IDropOperation {
 	splitDirection?: GroupDirection;
@@ -34,8 +29,6 @@ interface IDropOperation {
 class DropOverlay extends Themable {
 
 	private static readonly OVERLAY_ID = 'monaco-workbench-editor-drop-overlay';
-
-	private static readonly MAX_FILE_UPLOAD_SIZE = 100 * ByteSize.MB;
 
 	private container: HTMLElement | undefined;
 	private overlay: HTMLElement | undefined;
@@ -47,16 +40,17 @@ class DropOverlay extends Themable {
 
 	private readonly editorTransfer = LocalSelectionTransfer.getInstance<DraggedEditorIdentifier>();
 	private readonly groupTransfer = LocalSelectionTransfer.getInstance<DraggedEditorGroupIdentifier>();
+	private readonly treeItemsTransfer = LocalSelectionTransfer.getInstance<DraggedTreeItemsIdentifier>();
 
 	constructor(
 		private accessor: IEditorGroupsAccessor,
 		private groupView: IEditorGroupView,
 		@IThemeService themeService: IThemeService,
 		@IInstantiationService private instantiationService: IInstantiationService,
-		@IFileDialogService private readonly fileDialogService: IFileDialogService,
 		@IEditorService private readonly editorService: IEditorService,
-		@IDialogService private readonly dialogService: IDialogService,
-		@IEditorGroupsService private readonly editorGroupService: IEditorGroupsService
+		@IEditorGroupsService private readonly editorGroupService: IEditorGroupsService,
+		@ITreeViewsService private readonly treeViewsDragAndDropService: ITreeViewsService,
+		@IWorkspaceContextService private readonly contextService: IWorkspaceContextService
 	) {
 		super(themeService);
 
@@ -211,7 +205,7 @@ class DropOverlay extends Themable {
 		return undefined;
 	}
 
-	private handleDrop(event: DragEvent, splitDirection?: GroupDirection): void {
+	private async handleDrop(event: DragEvent, splitDirection?: GroupDirection): Promise<void> {
 
 		// Determine target group
 		const ensureTargetGroup = () => {
@@ -229,10 +223,7 @@ class DropOverlay extends Themable {
 		if (this.groupTransfer.hasData(DraggedEditorGroupIdentifier.prototype)) {
 			const data = this.groupTransfer.getData(DraggedEditorGroupIdentifier.prototype);
 			if (Array.isArray(data)) {
-				const draggedEditorGroup = data[0].identifier;
-
-				// Return if the drop is a no-op
-				const sourceGroup = this.accessor.getGroup(draggedEditorGroup);
+				const sourceGroup = this.accessor.getGroup(data[0].identifier);
 				if (sourceGroup) {
 					if (typeof splitDirection !== 'number' && sourceGroup === this.groupView) {
 						return;
@@ -250,11 +241,12 @@ class DropOverlay extends Themable {
 
 					// Merge into existing group
 					else {
+						let mergeGroupOptions: IMergeGroupOptions | undefined = undefined;
 						if (this.isCopyOperation(event)) {
-							targetGroup = this.accessor.mergeGroup(sourceGroup, this.groupView, { mode: MergeGroupMode.COPY_EDITORS });
-						} else {
-							targetGroup = this.accessor.mergeGroup(sourceGroup, this.groupView);
+							mergeGroupOptions = { mode: MergeGroupMode.COPY_EDITORS };
 						}
+
+						this.accessor.mergeGroup(sourceGroup, this.groupView, mergeGroupOptions);
 					}
 
 					if (targetGroup) {
@@ -273,7 +265,6 @@ class DropOverlay extends Themable {
 				const draggedEditor = data[0].identifier;
 				const targetGroup = ensureTargetGroup();
 
-				// Return if the drop is a no-op
 				const sourceGroup = this.accessor.getGroup(draggedEditor.groupId);
 				if (sourceGroup) {
 					if (sourceGroup === targetGroup) {
@@ -281,7 +272,7 @@ class DropOverlay extends Themable {
 					}
 
 					// Open in target group
-					const options = getActiveTextEditorOptions(sourceGroup, draggedEditor.editor, {
+					const options = fillActiveEditorViewState(sourceGroup, draggedEditor.editor, {
 						pinned: true,										// always pin dropped editor
 						sticky: sourceGroup.isSticky(draggedEditor.editor),	// preserve sticky state
 					});
@@ -301,64 +292,35 @@ class DropOverlay extends Themable {
 			}
 		}
 
-		// Web: check for file transfer
-		else if (isWeb && containsDragType(event, DataTransfers.FILES)) {
-			let targetGroup: IEditorGroupView | undefined = undefined;
-
-			const files = event.dataTransfer?.files;
-			if (files) {
-				for (let i = 0; i < files.length; i++) {
-					const file = files.item(i);
-					if (file) {
-
-						// Skip for very large files because this operation is unbuffered
-						if (file.size > DropOverlay.MAX_FILE_UPLOAD_SIZE) {
-							this.dialogService.show(Severity.Warning, localize('fileTooLarge', "File is too large to open as untitled editor. Please upload it first into the file explorer and then try again."));
-							continue;
-						}
-
-						// Read file fully and open as untitled editor
-						const reader = new FileReader();
-						reader.readAsArrayBuffer(file);
-						reader.onload = async event => {
-							const name = file.name;
-							if (typeof name === 'string' && event.target?.result instanceof ArrayBuffer) {
-
-								// Try to come up with a good file path for the untitled
-								// editor by asking the file dialog service for the default
-								let proposedFilePath: URI | undefined = undefined;
-								const defaultFilePath = await this.fileDialogService.defaultFilePath();
-								if (defaultFilePath) {
-									proposedFilePath = joinPath(defaultFilePath, name);
-								}
-
-								if (!targetGroup) {
-									targetGroup = ensureTargetGroup();
-								}
-
-								// Open as untitled text file with the provided contents
-								await this.editorService.openEditor({
-									resource: proposedFilePath,
-									forceUntitled: true,
-									contents: VSBuffer.wrap(new Uint8Array(event.target.result)).toString()
-								}, targetGroup.id);
-							}
-						};
+		// Check for tree items
+		else if (this.treeItemsTransfer.hasData(DraggedTreeItemsIdentifier.prototype)) {
+			const data = this.treeItemsTransfer.getData(DraggedTreeItemsIdentifier.prototype);
+			if (Array.isArray(data)) {
+				const editors: IUntypedEditorInput[] = [];
+				for (const id of data) {
+					const dataTransferItem = await this.treeViewsDragAndDropService.removeDragOperationTransfer(id.identifier);
+					if (dataTransferItem) {
+						const treeDropData = await extractTreeDropData(dataTransferItem);
+						editors.push(...treeDropData.map(editor => ({ ...editor, options: { ...editor.options, pinned: true } })));
 					}
 				}
+
+				this.editorService.openEditors(editors, ensureTargetGroup(), { validateTrust: true });
 			}
+
+			this.treeItemsTransfer.clearData(DraggedTreeItemsIdentifier.prototype);
 		}
 
 		// Check for URI transfer
 		else {
-			const dropHandler = this.instantiationService.createInstance(ResourcesDropHandler, { allowWorkspaceOpen: true /* open workspace instead of file if dropped */ });
+			const dropHandler = this.instantiationService.createInstance(ResourcesDropHandler, { allowWorkspaceOpen: !isWeb || isTemporaryWorkspace(this.contextService.getWorkspace()) });
 			dropHandler.handleDrop(event, () => ensureTargetGroup(), targetGroup => targetGroup?.focus());
 		}
 	}
 
 	private isCopyOperation(e: DragEvent, draggedEditor?: IEditorIdentifier): boolean {
 		if (draggedEditor?.editor.hasCapability(EditorInputCapabilities.Singleton)) {
-			return false;
+			return false; // Singleton editors cannot be split
 		}
 
 		return (e.ctrlKey && !isMacintosh) || (e.altKey && isMacintosh);
@@ -492,7 +454,7 @@ class DropOverlay extends Themable {
 		this.currentDropOperation = { splitDirection };
 	}
 
-	private doPositionOverlay(options: { top: string, left: string, width: string, height: string }): void {
+	private doPositionOverlay(options: { top: string; left: string; width: string; height: string }): void {
 		const [container, overlay] = assertAllDefined(this.container, this.overlay);
 
 		// Container

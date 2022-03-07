@@ -6,13 +6,13 @@
 import { ICodeEditor } from 'vs/editor/browser/editorBrowser';
 import { EditorAction, registerEditorAction, ServicesAccessor } from 'vs/editor/browser/editorExtensions';
 import { EditorContextKeys } from 'vs/editor/common/editorContextKeys';
-import { DocumentRangeFormattingEditProviderRegistry, DocumentFormattingEditProvider, DocumentRangeFormattingEditProvider } from 'vs/editor/common/modes';
+import { DocumentFormattingEditProvider, DocumentRangeFormattingEditProvider } from 'vs/editor/common/languages';
 import * as nls from 'vs/nls';
 import { ContextKeyExpr } from 'vs/platform/contextkey/common/contextkey';
 import { IQuickInputService, IQuickPickItem } from 'vs/platform/quickinput/common/quickInput';
 import { CancellationToken } from 'vs/base/common/cancellation';
 import { IInstantiationService } from 'vs/platform/instantiation/common/instantiation';
-import { formatDocumentRangesWithProvider, formatDocumentWithProvider, getRealAndSyntheticDocumentFormattersOrdered, FormattingConflicts, FormattingMode } from 'vs/editor/contrib/format/format';
+import { formatDocumentRangesWithProvider, formatDocumentWithProvider, getRealAndSyntheticDocumentFormattersOrdered, FormattingConflicts, FormattingMode } from 'vs/editor/contrib/format/browser/format';
 import { Range } from 'vs/editor/common/core/range';
 import { ITelemetryService } from 'vs/platform/telemetry/common/telemetry';
 import { ExtensionIdentifier } from 'vs/platform/extensions/common/extensions';
@@ -25,11 +25,11 @@ import { Disposable } from 'vs/base/common/lifecycle';
 import { IConfigurationService } from 'vs/platform/configuration/common/configuration';
 import { ITextModel } from 'vs/editor/common/model';
 import { INotificationService, Severity } from 'vs/platform/notification/common/notification';
-import { IModeService } from 'vs/editor/common/services/modeService';
-import { ILabelService } from 'vs/platform/label/common/label';
+import { ILanguageService } from 'vs/editor/common/languages/language';
 import { IWorkbenchExtensionEnablementService } from 'vs/workbench/services/extensionManagement/common/extensionManagement';
-import { editorConfigurationBaseNode } from 'vs/editor/common/config/commonEditorConfig';
+import { editorConfigurationBaseNode } from 'vs/editor/common/config/editorConfigurationSchema';
 import { IDialogService } from 'vs/platform/dialogs/common/dialogs';
+import { ILanguageFeaturesService } from 'vs/editor/common/services/languageFeatures';
 
 type FormattingEditProvider = DocumentFormattingEditProvider | DocumentRangeFormattingEditProvider;
 
@@ -48,8 +48,7 @@ class DefaultFormatter extends Disposable implements IWorkbenchContribution {
 		@INotificationService private readonly _notificationService: INotificationService,
 		@IDialogService private readonly _dialogService: IDialogService,
 		@IQuickInputService private readonly _quickInputService: IQuickInputService,
-		@IModeService private readonly _modeService: IModeService,
-		@ILabelService private readonly _labelService: ILabelService,
+		@ILanguageService private readonly _languageService: ILanguageService,
 	) {
 		super();
 		this._register(this._extensionService.onDidChangeExtensions(this._updateConfigValues, this));
@@ -98,7 +97,7 @@ class DefaultFormatter extends Disposable implements IWorkbenchContribution {
 
 		const defaultFormatterId = this._configService.getValue<string>(DefaultFormatter.configName, {
 			resource: document.uri,
-			overrideIdentifier: document.getModeId()
+			overrideIdentifier: document.getLanguageId()
 		});
 
 		if (defaultFormatterId) {
@@ -113,17 +112,31 @@ class DefaultFormatter extends Disposable implements IWorkbenchContribution {
 			const extension = await this._extensionService.getExtension(defaultFormatterId);
 			if (extension && this._extensionEnablementService.isEnabled(toExtension(extension))) {
 				// formatter does not target this file
-				const label = this._labelService.getUriLabel(document.uri, { relative: true });
-				const message = nls.localize('miss', "Extension '{0}' cannot format '{1}'", extension.displayName || extension.name, label);
-				this._notificationService.status(message, { hideAfter: 4000 });
-				return undefined;
+				const langName = this._languageService.getLanguageName(document.getLanguageId()) || document.getLanguageId();
+				const detail = nls.localize('miss', "Extension '{0}' is configured as formatter but it cannot format '{1}'-files", extension.displayName || extension.name, langName);
+				if (mode === FormattingMode.Silent) {
+					this._notificationService.status(detail, { hideAfter: 4000 });
+					return undefined;
+				} else {
+					const result = await this._dialogService.confirm({
+						message: nls.localize('miss.1', "Change Default Formatter"),
+						detail,
+						primaryButton: nls.localize('do.config', "Configure..."),
+						secondaryButton: nls.localize('cancel', "Cancel")
+					});
+					if (result.confirmed) {
+						return this._pickAndPersistDefaultFormatter(formatter, document);
+					} else {
+						return undefined;
+					}
+				}
 			}
 		} else if (formatter.length === 1) {
 			// ok -> nothing configured but only one formatter available
 			return formatter[0];
 		}
 
-		const langName = this._modeService.getLanguageName(document.getModeId()) || document.getModeId();
+		const langName = this._languageService.getLanguageName(document.getLanguageId()) || document.getLanguageId();
 		const message = !defaultFormatterId
 			? nls.localize('config.needed', "There are multiple formatters for '{0}' files. Select a default formatter to continue.", DefaultFormatter._maybeQuotes(langName))
 			: nls.localize('config.bad', "Extension '{0}' is configured as formatter but not available. Select a different default formatter to continue.", defaultFormatterId);
@@ -160,14 +173,14 @@ class DefaultFormatter extends Disposable implements IWorkbenchContribution {
 				description: formatter.extensionId && formatter.extensionId.value
 			};
 		});
-		const langName = this._modeService.getLanguageName(document.getModeId()) || document.getModeId();
+		const langName = this._languageService.getLanguageName(document.getLanguageId()) || document.getLanguageId();
 		const pick = await this._quickInputService.pick(picks, { placeHolder: nls.localize('select', "Select a default formatter for '{0}' files", DefaultFormatter._maybeQuotes(langName)) });
 		if (!pick || !formatter[pick.index].extensionId) {
 			return undefined;
 		}
 		this._configService.updateValue(DefaultFormatter.configName, formatter[pick.index].extensionId!.value, {
 			resource: document.uri,
-			overrideIdentifier: document.getModeId()
+			overrideIdentifier: document.getLanguageId()
 		});
 		return formatter[pick.index];
 	}
@@ -219,9 +232,9 @@ function logFormatterTelemetry<T extends { extensionId?: ExtensionIdentifier }>(
 async function showFormatterPick(accessor: ServicesAccessor, model: ITextModel, formatters: FormattingEditProvider[]): Promise<number | undefined> {
 	const quickPickService = accessor.get(IQuickInputService);
 	const configService = accessor.get(IConfigurationService);
-	const modeService = accessor.get(IModeService);
+	const languageService = accessor.get(ILanguageService);
 
-	const overrides = { resource: model.uri, overrideIdentifier: model.getModeId() };
+	const overrides = { resource: model.uri, overrideIdentifier: model.getLanguageId() };
 	const defaultFormatter = configService.getValue<string>(DefaultFormatter.configName, overrides);
 
 	let defaultFormatterPick: IIndexedPick | undefined;
@@ -258,7 +271,7 @@ async function showFormatterPick(accessor: ServicesAccessor, model: ITextModel, 
 
 	} else if (pick === configurePick) {
 		// config default
-		const langName = modeService.getLanguageName(model.getModeId()) || model.getModeId();
+		const langName = languageService.getLanguageName(model.getLanguageId()) || model.getLanguageId();
 		const pick = await quickPickService.pick(picks, { placeHolder: nls.localize('select', "Select a default formatter for '{0}' files", DefaultFormatter._maybeQuotes(langName)) });
 		if (pick && formatters[pick.index].extensionId) {
 			configService.updateValue(DefaultFormatter.configName, formatters[pick.index].extensionId!.value, overrides);
@@ -293,8 +306,9 @@ registerEditorAction(class FormatDocumentMultipleAction extends EditorAction {
 		}
 		const instaService = accessor.get(IInstantiationService);
 		const telemetryService = accessor.get(ITelemetryService);
+		const languageFeaturesService = accessor.get(ILanguageFeaturesService);
 		const model = editor.getModel();
-		const provider = getRealAndSyntheticDocumentFormattersOrdered(model);
+		const provider = getRealAndSyntheticDocumentFormattersOrdered(languageFeaturesService.documentFormattingEditProvider, languageFeaturesService.documentRangeFormattingEditProvider, model);
 		const pick = await instaService.invokeFunction(showFormatterPick, model, provider);
 		if (typeof pick === 'number') {
 			await instaService.invokeFunction(formatDocumentWithProvider, provider[pick], editor, FormattingMode.Explicit, CancellationToken.None);
@@ -324,6 +338,7 @@ registerEditorAction(class FormatSelectionMultipleAction extends EditorAction {
 			return;
 		}
 		const instaService = accessor.get(IInstantiationService);
+		const languageFeaturesService = accessor.get(ILanguageFeaturesService);
 		const telemetryService = accessor.get(ITelemetryService);
 
 		const model = editor.getModel();
@@ -332,7 +347,7 @@ registerEditorAction(class FormatSelectionMultipleAction extends EditorAction {
 			range = new Range(range.startLineNumber, 1, range.startLineNumber, model.getLineMaxColumn(range.startLineNumber));
 		}
 
-		const provider = DocumentRangeFormattingEditProviderRegistry.ordered(model);
+		const provider = languageFeaturesService.documentRangeFormattingEditProvider.ordered(model);
 		const pick = await instaService.invokeFunction(showFormatterPick, model, provider);
 		if (typeof pick === 'number') {
 			await instaService.invokeFunction(formatDocumentRangesWithProvider, provider[pick], editor, range, CancellationToken.None);

@@ -19,6 +19,12 @@ suite('vscode', function () {
 		assertNoRpc();
 	});
 
+	test('no rpc, createDiagnosticCollection()', function () {
+		const item = vscode.languages.createDiagnosticCollection();
+		dispo.push(item);
+		assertNoRpcFromEntry([item, 'DiagnosticCollection']);
+	});
+
 	test('no rpc, createTextEditorDecorationType(...)', function () {
 		const item = vscode.window.createTextEditorDecorationType({});
 		dispo.push(item);
@@ -56,7 +62,6 @@ suite('vscode', function () {
 	});
 
 	test('no rpc, createSourceControl(...)', function () {
-		this.skip();
 		const item = vscode.scm.createSourceControl('foo', 'Hello');
 		dispo.push(item);
 		assertNoRpcFromEntry([item, 'SourceControl']);
@@ -98,5 +103,29 @@ suite('vscode', function () {
 		const ctrl = vscode.notebooks.createNotebookController('foo', 'bar', '');
 		dispo.push(ctrl);
 		assertNoRpcFromEntry([ctrl, 'NotebookController']);
+	});
+
+	test('no rpc, createTerminal(...)', function () {
+		const ctrl = vscode.window.createTerminal({ name: 'termi' });
+		dispo.push(ctrl);
+		assertNoRpcFromEntry([ctrl, 'Terminal']);
+	});
+
+	test('no rpc, createFileSystemWatcher(...)', function () {
+		const item = vscode.workspace.createFileSystemWatcher('**/*.ts');
+		dispo.push(item);
+		assertNoRpcFromEntry([item, 'FileSystemWatcher']);
+	});
+
+	test('no rpc, createTestController(...)', function () {
+		const item = vscode.tests.createTestController('iii', 'lll');
+		dispo.push(item);
+		assertNoRpcFromEntry([item, 'TestController']);
+	});
+
+	test('no rpc, createLanguageStatusItem(...)', function () {
+		const item = vscode.languages.createLanguageStatusItem('i', '*');
+		dispo.push(item);
+		assertNoRpcFromEntry([item, 'LanguageStatusItem']);
 	});
 });
