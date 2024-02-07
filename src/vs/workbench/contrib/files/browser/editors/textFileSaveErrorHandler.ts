@@ -6,9 +6,9 @@
 import { localize } from 'vs/nls';
 import { toErrorMessage } from 'vs/base/common/errorMessage';
 import { basename, isEqual } from 'vs/base/common/resources';
-import { Action, IAction } from 'vs/base/common/actions';
+import { Action } from 'vs/base/common/actions';
 import { URI } from 'vs/base/common/uri';
-import { FileOperationError, FileOperationResult } from 'vs/platform/files/common/files';
+import { FileOperationError, FileOperationResult, IWriteFileOptions } from 'vs/platform/files/common/files';
 import { ITextFileService, ISaveErrorHandler, ITextFileEditorModel, ITextFileSaveAsOptions } from 'vs/workbench/services/textfile/common/textfiles';
 import { ServicesAccessor, IInstantiationService } from 'vs/platform/instantiation/common/instantiation';
 import { IDisposable, dispose, Disposable } from 'vs/base/common/lifecycle';
@@ -42,6 +42,8 @@ const conflictEditorHelp = localize('userGuide', "Use the actions in the editor 
 // A handler for text file save error happening with conflict resolution actions
 export class TextFileSaveErrorHandler extends Disposable implements ISaveErrorHandler, IWorkbenchContribution {
 
+	static readonly ID = 'workbench.contrib.textFileSaveErrorHandler';
+
 	private readonly messages = new ResourceMap<INotificationHandle>();
 	private readonly conflictResolutionContext = new RawContextKey<boolean>(CONFLICT_RESOLUTION_CONTEXT, false, true).bindTo(this.contextKeyService);
 	private activeConflictResolutionResource: URI | undefined = undefined;
@@ -67,7 +69,7 @@ export class TextFileSaveErrorHandler extends Disposable implements ISaveErrorHa
 	}
 
 	private registerListeners(): void {
-		this._register(this.textFileService.files.onDidSave(event => this.onFileSavedOrReverted(event.model.resource)));
+		this._register(this.textFileService.files.onDidSave(e => this.onFileSavedOrReverted(e.model.resource)));
 		this._register(this.textFileService.files.onDidRevert(model => this.onFileSavedOrReverted(model.resource)));
 		this._register(this.editorService.onDidActiveEditorChange(() => this.onActiveEditorChanged()));
 	}
@@ -102,15 +104,15 @@ export class TextFileSaveErrorHandler extends Disposable implements ISaveErrorHa
 		const resource = model.resource;
 
 		let message: string;
-		const primaryActions: IAction[] = [];
-		const secondaryActions: IAction[] = [];
+		const primaryActions: Action[] = [];
+		const secondaryActions: Action[] = [];
 
 		// Dirty write prevention
 		if (fileOperationError.fileOperationResult === FileOperationResult.FILE_MODIFIED_SINCE) {
 
 			// If the user tried to save from the opened conflict editor, show its message again
 			if (this.activeConflictResolutionResource && isEqual(this.activeConflictResolutionResource, model.resource)) {
-				if (this.storageService.getBoolean(LEARN_MORE_DIRTY_WRITE_IGNORE_KEY, StorageScope.GLOBAL)) {
+				if (this.storageService.getBoolean(LEARN_MORE_DIRTY_WRITE_IGNORE_KEY, StorageScope.APPLICATION)) {
 					return; // return if this message is ignored
 				}
 
@@ -134,7 +136,7 @@ export class TextFileSaveErrorHandler extends Disposable implements ISaveErrorHa
 		// Any other save error
 		else {
 			const isWriteLocked = fileOperationError.fileOperationResult === FileOperationResult.FILE_WRITE_LOCKED;
-			const triedToUnlock = isWriteLocked && fileOperationError.options?.unlock;
+			const triedToUnlock = isWriteLocked && (fileOperationError.options as IWriteFileOptions | undefined)?.unlock;
 			const isPermissionDenied = fileOperationError.fileOperationResult === FileOperationResult.FILE_PERMISSION_DENIED;
 			const canSaveElevated = resource.scheme === Schemas.file; // currently only supported for local schemes (https://github.com/microsoft/vscode/issues/48659)
 
@@ -196,9 +198,7 @@ const pendingResolveSaveConflictMessages: INotificationHandle[] = [];
 function clearPendingResolveSaveConflictMessages(): void {
 	while (pendingResolveSaveConflictMessages.length > 0) {
 		const item = pendingResolveSaveConflictMessages.pop();
-		if (item) {
-			item.close();
-		}
+		item?.close();
 	}
 }
 
@@ -225,8 +225,8 @@ class DoNotShowResolveConflictLearnMoreAction extends Action {
 
 	override async run(notification: IDisposable): Promise<void> {
 
-		// Remember this as global state
-		this.storageService.store(LEARN_MORE_DIRTY_WRITE_IGNORE_KEY, true, StorageScope.GLOBAL, StorageTarget.USER);
+		// Remember this as application state
+		this.storageService.store(LEARN_MORE_DIRTY_WRITE_IGNORE_KEY, true, StorageScope.APPLICATION, StorageTarget.USER);
 
 		// Hide notification
 		notification.dispose();
@@ -324,7 +324,7 @@ class SaveModelAsAction extends Action {
 		private model: ITextFileEditorModel,
 		@IEditorService private editorService: IEditorService
 	) {
-		super('workbench.files.action.saveModelAs', SAVE_FILE_AS_LABEL);
+		super('workbench.files.action.saveModelAs', SAVE_FILE_AS_LABEL.value);
 	}
 
 	override async run(): Promise<void> {

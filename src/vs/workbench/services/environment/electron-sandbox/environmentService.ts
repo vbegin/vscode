@@ -12,8 +12,8 @@ import { AbstractNativeEnvironmentService } from 'vs/platform/environment/common
 import { memoize } from 'vs/base/common/decorators';
 import { URI } from 'vs/base/common/uri';
 import { Schemas } from 'vs/base/common/network';
-import { join } from 'vs/base/common/path';
 import { IProductService } from 'vs/platform/product/common/productService';
+import { joinPath } from 'vs/base/common/resources';
 
 export const INativeWorkbenchEnvironmentService = refineServiceDecorator<IEnvironmentService, INativeWorkbenchEnvironmentService>(IEnvironmentService);
 
@@ -38,6 +38,7 @@ export interface INativeWorkbenchEnvironmentService extends IBrowserWorkbenchEnv
 	readonly mainPid: number;
 	readonly os: IOSConfiguration;
 	readonly machineId: string;
+	readonly sqmId: string;
 
 	// --- Paths
 	readonly execPath: string;
@@ -60,7 +61,13 @@ export class NativeWorkbenchEnvironmentService extends AbstractNativeEnvironment
 	get machineId() { return this.configuration.machineId; }
 
 	@memoize
+	get sqmId() { return this.configuration.sqmId; }
+
+	@memoize
 	get remoteAuthority() { return this.configuration.remoteAuthority; }
+
+	@memoize
+	get expectsResolverExtension() { return !!this.configuration.remoteAuthority?.includes('+'); }
 
 	@memoize
 	get execPath() { return this.configuration.execPath; }
@@ -82,13 +89,18 @@ export class NativeWorkbenchEnvironmentService extends AbstractNativeEnvironment
 	}
 
 	@memoize
-	override get userRoamingDataHome(): URI { return this.appSettingsHome.with({ scheme: Schemas.userData }); }
+	get windowLogsPath(): URI { return joinPath(this.logsHome, `window${this.configuration.windowId}`); }
 
 	@memoize
-	get logFile(): URI { return URI.file(join(this.logsPath, `renderer${this.configuration.windowId}.log`)); }
+	get logFile(): URI { return joinPath(this.windowLogsPath, `renderer.log`); }
 
 	@memoize
-	get extHostLogsPath(): URI { return URI.file(join(this.logsPath, `exthost${this.configuration.windowId}`)); }
+	get extHostLogsPath(): URI { return joinPath(this.windowLogsPath, 'exthost'); }
+
+	@memoize
+	get extHostTelemetryLogFile(): URI {
+		return joinPath(this.extHostLogsPath, 'extensionTelemetry.log');
+	}
 
 	@memoize
 	get webviewExternalEndpoint(): string { return `${Schemas.vscodeWebview}://{{uuid}}`; }
@@ -101,6 +113,9 @@ export class NativeWorkbenchEnvironmentService extends AbstractNativeEnvironment
 
 	@memoize
 	get logExtensionHostCommunication(): boolean { return !!this.args.logExtensionHostCommunication; }
+
+	@memoize
+	get enableSmokeTestDriver(): boolean { return !!this.args['enable-smoke-test-driver']; }
 
 	@memoize
 	get extensionEnabledProposedApi(): string[] | undefined {
@@ -123,6 +138,9 @@ export class NativeWorkbenchEnvironmentService extends AbstractNativeEnvironment
 
 	@memoize
 	get filesToDiff(): IPath[] | undefined { return this.configuration.filesToDiff; }
+
+	@memoize
+	get filesToMerge(): IPath[] | undefined { return this.configuration.filesToMerge; }
 
 	@memoize
 	get filesToWait(): IPathsToWaitFor | undefined { return this.configuration.filesToWait; }

@@ -3,30 +3,28 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { flatten } from 'vs/base/common/arrays';
+import { fromNow } from 'vs/base/common/date';
 import { Emitter, Event } from 'vs/base/common/event';
 import { IJSONSchema } from 'vs/base/common/jsonSchema';
-import { Disposable, dispose, IDisposable, MutableDisposable } from 'vs/base/common/lifecycle';
-import { isWeb } from 'vs/base/common/platform';
+import { Disposable, DisposableMap, DisposableStore, dispose, IDisposable, isDisposable, MutableDisposable } from 'vs/base/common/lifecycle';
 import { isFalsyOrWhitespace } from 'vs/base/common/strings';
 import { isString } from 'vs/base/common/types';
 import * as nls from 'vs/nls';
 import { MenuId, MenuRegistry } from 'vs/platform/actions/common/actions';
 import { CommandsRegistry } from 'vs/platform/commands/common/commands';
 import { ContextKeyExpr } from 'vs/platform/contextkey/common/contextkey';
-import { ICredentialsService } from 'vs/platform/credentials/common/credentials';
 import { IDialogService } from 'vs/platform/dialogs/common/dialogs';
-import { registerSingleton } from 'vs/platform/instantiation/common/extensions';
+import { InstantiationType, registerSingleton } from 'vs/platform/instantiation/common/extensions';
 import { Severity } from 'vs/platform/notification/common/notification';
 import { IProductService } from 'vs/platform/product/common/productService';
 import { IQuickInputService } from 'vs/platform/quickinput/common/quickInput';
+import { ISecretStorageService } from 'vs/platform/secrets/common/secrets';
 import { IStorageService, StorageScope, StorageTarget } from 'vs/platform/storage/common/storage';
 import { IActivityService, NumberBadge } from 'vs/workbench/services/activity/common/activity';
-import { AuthenticationProviderInformation, AuthenticationSession, AuthenticationSessionsChangeEvent, IAuthenticationProvider, IAuthenticationService } from 'vs/workbench/services/authentication/common/authentication';
+import { IAuthenticationCreateSessionOptions, AuthenticationProviderInformation, AuthenticationSession, AuthenticationSessionsChangeEvent, IAuthenticationProvider, IAuthenticationService } from 'vs/workbench/services/authentication/common/authentication';
 import { IBrowserWorkbenchEnvironmentService } from 'vs/workbench/services/environment/browser/environmentService';
 import { ActivationKind, IExtensionService } from 'vs/workbench/services/extensions/common/extensions';
 import { ExtensionsRegistry } from 'vs/workbench/services/extensions/common/extensionsRegistry';
-import { IRemoteAgentService } from 'vs/workbench/services/remote/common/remoteAgentService';
 
 export function getAuthenticationProviderActivationEvent(id: string): string { return `onAuthenticationRequest:${id}`; }
 
@@ -36,18 +34,11 @@ interface IAccountUsage {
 	lastUsed: number;
 }
 
-const FIRST_PARTY_ALLOWED_EXTENSIONS = [
-	'github.vscode-pull-request-github',
-	'vscode.git',
-	'github.remotehub',
-	'github.remotehub-insiders',
-	'github.codespaces',
-	'ms-vsliveshare.vsliveshare'
-];
+// TODO: make this account usage stuff a service
 
-export function readAccountUsages(storageService: IStorageService, providerId: string, accountName: string,): IAccountUsage[] {
+function readAccountUsages(storageService: IStorageService, providerId: string, accountName: string,): IAccountUsage[] {
 	const accountKey = `${providerId}-${accountName}-usages`;
-	const storedUsages = storageService.get(accountKey, StorageScope.GLOBAL);
+	const storedUsages = storageService.get(accountKey, StorageScope.APPLICATION);
 	let usages: IAccountUsage[] = [];
 	if (storedUsages) {
 		try {
@@ -60,9 +51,9 @@ export function readAccountUsages(storageService: IStorageService, providerId: s
 	return usages;
 }
 
-export function removeAccountUsage(storageService: IStorageService, providerId: string, accountName: string): void {
+function removeAccountUsage(storageService: IStorageService, providerId: string, accountName: string): void {
 	const accountKey = `${providerId}-${accountName}-usages`;
-	storageService.remove(accountKey, StorageScope.GLOBAL);
+	storageService.remove(accountKey, StorageScope.APPLICATION);
 }
 
 export function addAccountUsage(storageService: IStorageService, providerId: string, accountName: string, extensionId: string, extensionName: string) {
@@ -84,20 +75,29 @@ export function addAccountUsage(storageService: IStorageService, providerId: str
 		});
 	}
 
-	storageService.store(accountKey, JSON.stringify(usages), StorageScope.GLOBAL, StorageTarget.MACHINE);
+	storageService.store(accountKey, JSON.stringify(usages), StorageScope.APPLICATION, StorageTarget.MACHINE);
 }
 
+// TODO: pull this out into its own service
 export type AuthenticationSessionInfo = { readonly id: string; readonly accessToken: string; readonly providerId: string; readonly canSignOut?: boolean };
-export async function getCurrentAuthenticationSessionInfo(credentialsService: ICredentialsService, productService: IProductService): Promise<AuthenticationSessionInfo | undefined> {
-	const authenticationSessionValue = await credentialsService.getPassword(`${productService.urlProtocol}.login`, 'account');
+export async function getCurrentAuthenticationSessionInfo(
+	secretStorageService: ISecretStorageService,
+	productService: IProductService
+): Promise<AuthenticationSessionInfo | undefined> {
+	const authenticationSessionValue = await secretStorageService.get(`${productService.urlProtocol}.loginAccount`);
 	if (authenticationSessionValue) {
-		const authenticationSessionInfo: AuthenticationSessionInfo = JSON.parse(authenticationSessionValue);
-		if (authenticationSessionInfo
-			&& isString(authenticationSessionInfo.id)
-			&& isString(authenticationSessionInfo.accessToken)
-			&& isString(authenticationSessionInfo.providerId)
-		) {
-			return authenticationSessionInfo;
+		try {
+			const authenticationSessionInfo: AuthenticationSessionInfo = JSON.parse(authenticationSessionValue);
+			if (authenticationSessionInfo
+				&& isString(authenticationSessionInfo.id)
+				&& isString(authenticationSessionInfo.accessToken)
+				&& isString(authenticationSessionInfo.providerId)
+			) {
+				return authenticationSessionInfo;
+			}
+		} catch (e) {
+			// This is a best effort operation.
+			console.error(`Failed parsing current auth session value: ${e}`);
 		}
 	}
 	return undefined;
@@ -109,10 +109,10 @@ export interface AllowedExtension {
 	allowed?: boolean;
 }
 
-export function readAllowedExtensions(storageService: IStorageService, providerId: string, accountName: string): AllowedExtension[] {
+function readAllowedExtensions(storageService: IStorageService, providerId: string, accountName: string): AllowedExtension[] {
 	let trustedExtensions: AllowedExtension[] = [];
 	try {
-		const trustedExtensionSrc = storageService.get(`${providerId}-${accountName}`, StorageScope.GLOBAL);
+		const trustedExtensionSrc = storageService.get(`${providerId}-${accountName}`, StorageScope.APPLICATION);
 		if (trustedExtensionSrc) {
 			trustedExtensions = JSON.parse(trustedExtensionSrc);
 		}
@@ -159,17 +159,32 @@ const authenticationExtPoint = ExtensionsRegistry.registerExtensionPoint<Authent
 		description: nls.localize({ key: 'authenticationExtensionPoint', comment: [`'Contributes' means adds here`] }, 'Contributes authentication'),
 		type: 'array',
 		items: authenticationDefinitionSchema
+	},
+	activationEventsGenerator: (authenticationProviders, result) => {
+		for (const authenticationProvider of authenticationProviders) {
+			if (authenticationProvider.id) {
+				result.push(`onAuthenticationRequest:${authenticationProvider.id}`);
+			}
+		}
 	}
+});
+
+let placeholderMenuItem: IDisposable | undefined = MenuRegistry.appendMenuItem(MenuId.AccountsContext, {
+	command: {
+		id: 'noAuthenticationProviders',
+		title: nls.localize('authentication.Placeholder', "No accounts requested yet..."),
+		precondition: ContextKeyExpr.false()
+	},
 });
 
 export class AuthenticationService extends Disposable implements IAuthenticationService {
 	declare readonly _serviceBrand: undefined;
-	private _placeholderMenuItem: IDisposable | undefined;
 	private _signInRequestItems = new Map<string, SessionRequestInfo>();
 	private _sessionAccessRequestItems = new Map<string, { [extensionId: string]: { disposables: IDisposable[]; possibleSessions: AuthenticationSession[] } }>();
 	private _accountBadgeDisposable = this._register(new MutableDisposable());
 
 	private _authenticationProviders: Map<string, IAuthenticationProvider> = new Map<string, IAuthenticationProvider>();
+	private _authenticationProviderDisposables: DisposableMap<string, IDisposable> = this._register(new DisposableMap<string, IDisposable>());
 
 	/**
 	 * All providers that have been statically declared by extensions. These may not be registered.
@@ -192,19 +207,14 @@ export class AuthenticationService extends Disposable implements IAuthentication
 		@IActivityService private readonly activityService: IActivityService,
 		@IExtensionService private readonly extensionService: IExtensionService,
 		@IStorageService private readonly storageService: IStorageService,
-		@IRemoteAgentService private readonly remoteAgentService: IRemoteAgentService,
 		@IDialogService private readonly dialogService: IDialogService,
-		@IQuickInputService private readonly quickInputService: IQuickInputService
+		@IQuickInputService private readonly quickInputService: IQuickInputService,
+		@IProductService private readonly productService: IProductService,
+		@IBrowserWorkbenchEnvironmentService environmentService: IBrowserWorkbenchEnvironmentService,
 	) {
 		super();
-		this._placeholderMenuItem = MenuRegistry.appendMenuItem(MenuId.AccountsContext, {
-			command: {
-				id: 'noAuthenticationProviders',
-				title: nls.localize('loading', "Loading..."),
-				precondition: ContextKeyExpr.false()
-			},
-		});
 
+		environmentService.options?.authenticationProviders?.forEach(provider => this.registerAuthenticationProvider(provider.id, provider));
 		authenticationExtPoint.setHandler((extensions, { added, removed }) => {
 			added.forEach(point => {
 				for (const provider of point.value) {
@@ -226,7 +236,7 @@ export class AuthenticationService extends Disposable implements IAuthentication
 				}
 			});
 
-			const removedExtPoints = flatten(removed.map(r => r.value));
+			const removedExtPoints = removed.flatMap(r => r.value);
 			removedExtPoints.forEach(point => {
 				const index = this.declaredProviders.findIndex(provider => provider.id === point.id);
 				if (index > -1) {
@@ -252,18 +262,23 @@ export class AuthenticationService extends Disposable implements IAuthentication
 
 	registerAuthenticationProvider(id: string, authenticationProvider: IAuthenticationProvider): void {
 		this._authenticationProviders.set(id, authenticationProvider);
+		const disposableStore = new DisposableStore();
+		disposableStore.add(authenticationProvider.onDidChangeSessions(e => this.sessionsUpdate(authenticationProvider, e)));
+		if (isDisposable(authenticationProvider)) {
+			disposableStore.add(authenticationProvider);
+		}
+		this._authenticationProviderDisposables.set(id, disposableStore);
 		this._onDidRegisterAuthenticationProvider.fire({ id, label: authenticationProvider.label });
 
-		if (this._placeholderMenuItem) {
-			this._placeholderMenuItem.dispose();
-			this._placeholderMenuItem = undefined;
+		if (placeholderMenuItem) {
+			placeholderMenuItem.dispose();
+			placeholderMenuItem = undefined;
 		}
 	}
 
 	unregisterAuthenticationProvider(id: string): void {
 		const provider = this._authenticationProviders.get(id);
 		if (provider) {
-			provider.dispose();
 			this._authenticationProviders.delete(id);
 			this._onDidUnregisterAuthenticationProvider.fire({ id, label: provider.label });
 
@@ -272,9 +287,10 @@ export class AuthenticationService extends Disposable implements IAuthentication
 				this.removeAccessRequest(id, extensionId);
 			});
 		}
+		this._authenticationProviderDisposables.deleteAndDispose(id);
 
 		if (!this._authenticationProviders.size) {
-			this._placeholderMenuItem = MenuRegistry.appendMenuItem(MenuId.AccountsContext, {
+			placeholderMenuItem = MenuRegistry.appendMenuItem(MenuId.AccountsContext, {
 				command: {
 					id: 'noAuthenticationProviders',
 					title: nls.localize('loading', "Loading..."),
@@ -284,21 +300,15 @@ export class AuthenticationService extends Disposable implements IAuthentication
 		}
 	}
 
-	async sessionsUpdate(id: string, event: AuthenticationSessionsChangeEvent): Promise<void> {
-		const provider = this._authenticationProviders.get(id);
-		if (provider) {
-			this._onDidChangeSessions.fire({ providerId: id, label: provider.label, event: event });
-
-			if (event.added) {
-				await this.updateNewSessionRequests(provider, event.added);
-			}
-
-			if (event.removed) {
-				await this.updateAccessRequests(id, event.removed);
-			}
-
-			this.updateBadgeCount();
+	private async sessionsUpdate(provider: IAuthenticationProvider, event: AuthenticationSessionsChangeEvent): Promise<void> {
+		this._onDidChangeSessions.fire({ providerId: provider.id, label: provider.label, event });
+		if (event.added?.length) {
+			await this.updateNewSessionRequests(provider, event.added);
 		}
+		if (event.removed?.length) {
+			await this.updateAccessRequests(provider.id, event.removed);
+		}
+		this.updateBadgeCount();
 	}
 
 	private async updateNewSessionRequests(provider: IAuthenticationProvider, addedSessions: readonly AuthenticationSession[]): Promise<void> {
@@ -387,21 +397,14 @@ export class AuthenticationService extends Disposable implements IAuthentication
 				: true;
 		}
 
-		const remoteConnection = this.remoteAgentService.getConnection();
-		// Right now, this is hardcoded to only happen in Codespaces and on web.
-		// TODO: this should be determined by the embedder so that this logic isn't in core.
-		const allowedAllowedExtensions = remoteConnection !== null
-			? remoteConnection.remoteAuthority.startsWith('codespaces')
-			: isWeb;
-
-		if (allowedAllowedExtensions && FIRST_PARTY_ALLOWED_EXTENSIONS.includes(extensionId)) {
+		if (this.productService.trustedExtensionAuthAccess?.includes(extensionId)) {
 			return true;
 		}
 
 		return undefined;
 	}
 
-	async updatedAllowedExtension(providerId: string, accountName: string, extensionId: string, extensionName: string, isAllowed: boolean): Promise<void> {
+	updateAllowedExtension(providerId: string, accountName: string, extensionId: string, extensionName: string, isAllowed: boolean): void {
 		const allowList = readAllowedExtensions(this.storageService, providerId, accountName);
 		const index = allowList.findIndex(extension => extension.id === extensionId);
 		if (index === -1) {
@@ -410,28 +413,84 @@ export class AuthenticationService extends Disposable implements IAuthentication
 			allowList[index].allowed = isAllowed;
 		}
 
-		await this.storageService.store(`${providerId}-${accountName}`, JSON.stringify(allowList), StorageScope.GLOBAL, StorageTarget.USER);
+		this.storageService.store(`${providerId}-${accountName}`, JSON.stringify(allowList), StorageScope.APPLICATION, StorageTarget.USER);
 	}
+
+	//#region Session Preference
+
+	updateSessionPreference(providerId: string, extensionId: string, session: AuthenticationSession): void {
+		// The 3 parts of this key are important:
+		// * Extension id: The extension that has a preference
+		// * Provider id: The provider that the preference is for
+		// * The scopes: The subset of sessions that the preference applies to
+		const key = `${extensionId}-${providerId}-${session.scopes.join(' ')}`;
+
+		// Store the preference in the workspace and application storage. This allows new workspaces to
+		// have a preference set already to limit the number of prompts that are shown... but also allows
+		// a specific workspace to override the global preference.
+		this.storageService.store(key, session.id, StorageScope.WORKSPACE, StorageTarget.MACHINE);
+		this.storageService.store(key, session.id, StorageScope.APPLICATION, StorageTarget.MACHINE);
+	}
+
+	getSessionPreference(providerId: string, extensionId: string, scopes: string[]): string | undefined {
+		// The 3 parts of this key are important:
+		// * Extension id: The extension that has a preference
+		// * Provider id: The provider that the preference is for
+		// * The scopes: The subset of sessions that the preference applies to
+		const key = `${extensionId}-${providerId}-${scopes.join(' ')}`;
+
+		// If a preference is set in the workspace, use that. Otherwise, use the global preference.
+		return this.storageService.get(key, StorageScope.WORKSPACE) ?? this.storageService.get(key, StorageScope.APPLICATION);
+	}
+
+	removeSessionPreference(providerId: string, extensionId: string, scopes: string[]): void {
+		// The 3 parts of this key are important:
+		// * Extension id: The extension that has a preference
+		// * Provider id: The provider that the preference is for
+		// * The scopes: The subset of sessions that the preference applies to
+		const key = `${extensionId}-${providerId}-${scopes.join(' ')}`;
+
+		// This won't affect any other workspaces that have a preference set, but it will remove the preference
+		// for this workspace and the global preference. This is only paired with a call to updateSessionPreference...
+		// so we really don't _need_ to remove them as they are about to be overridden anyway... but it's more correct
+		// to remove them first... and in case this gets called from somewhere else in the future.
+		this.storageService.remove(key, StorageScope.WORKSPACE);
+		this.storageService.remove(key, StorageScope.APPLICATION);
+	}
+
+	//#endregion
 
 	async showGetSessionPrompt(providerId: string, accountName: string, extensionId: string, extensionName: string): Promise<boolean> {
 		const providerName = this.getLabel(providerId);
-		const { choice } = await this.dialogService.show(
-			Severity.Info,
-			nls.localize('confirmAuthenticationAccess', "The extension '{0}' wants to access the {1} account '{2}'.", extensionName, providerName, accountName),
-			[nls.localize('allow', "Allow"), nls.localize('deny', "Deny"), nls.localize('cancel', "Cancel")],
-			{
-				cancelId: 2
+		enum SessionPromptChoice {
+			Allow = 0,
+			Deny = 1,
+			Cancel = 2
+		}
+		const { result } = await this.dialogService.prompt<SessionPromptChoice>({
+			type: Severity.Info,
+			message: nls.localize('confirmAuthenticationAccess', "The extension '{0}' wants to access the {1} account '{2}'.", extensionName, providerName, accountName),
+			buttons: [
+				{
+					label: nls.localize({ key: 'allow', comment: ['&& denotes a mnemonic'] }, "&&Allow"),
+					run: () => SessionPromptChoice.Allow
+				},
+				{
+					label: nls.localize({ key: 'deny', comment: ['&& denotes a mnemonic'] }, "&&Deny"),
+					run: () => SessionPromptChoice.Deny
+				}
+			],
+			cancelButton: {
+				run: () => SessionPromptChoice.Cancel
 			}
-		);
+		});
 
-		const cancelled = choice === 2;
-		const allowed = choice === 0;
-		if (!cancelled) {
-			this.updatedAllowedExtension(providerId, accountName, extensionId, extensionName, allowed);
+		if (result !== SessionPromptChoice.Cancel) {
+			this.updateAllowedExtension(providerId, accountName, extensionId, extensionName, result === SessionPromptChoice.Allow);
 			this.removeAccessRequest(providerId, extensionId);
 		}
 
-		return allowed;
+		return result === SessionPromptChoice.Allow;
 	}
 
 	async selectSession(providerId: string, extensionId: string, extensionName: string, scopes: string[], availableSessions: AuthenticationSession[]): Promise<AuthenticationSession> {
@@ -472,10 +531,9 @@ export class AuthenticationService extends Disposable implements IAuthentication
 				const session = quickPick.selectedItems[0].session ?? await this.createSession(providerId, scopes);
 				const accountName = session.account.label;
 
-				this.updatedAllowedExtension(providerId, accountName, extensionId, extensionName, true);
-
+				this.updateAllowedExtension(providerId, accountName, extensionId, extensionName, true);
+				this.updateSessionPreference(providerId, extensionId, session);
 				this.removeAccessRequest(providerId, extensionId);
-				this.storageService.store(`${extensionName}-${providerId}`, session.id, StorageScope.GLOBAL, StorageTarget.MACHINE);
 
 				quickPick.dispose();
 				resolve(session);
@@ -565,9 +623,10 @@ export class AuthenticationService extends Disposable implements IAuthentication
 			// since this is sync and returns a disposable. So, wait for registration event to fire that indicates the
 			// provider is now in the map.
 			await new Promise<void>((resolve, _) => {
-				this.onDidRegisterAuthenticationProvider(e => {
+				const dispose = this.onDidRegisterAuthenticationProvider(e => {
 					if (e.id === providerId) {
 						provider = this._authenticationProviders.get(providerId);
+						dispose.dispose();
 						resolve();
 					}
 				});
@@ -608,14 +667,10 @@ export class AuthenticationService extends Disposable implements IAuthentication
 			id: commandId,
 			handler: async (accessor) => {
 				const authenticationService = accessor.get(IAuthenticationService);
-				const storageService = accessor.get(IStorageService);
 				const session = await authenticationService.createSession(providerId, scopes);
 
-				// Add extension to allow list since user explicitly signed in on behalf of it
-				this.updatedAllowedExtension(providerId, session.account.label, extensionId, extensionName, true);
-
-				// And also set it as the preferred account for the extension
-				storageService.store(`${extensionName}-${providerId}`, session.id, StorageScope.GLOBAL, StorageTarget.MACHINE);
+				this.updateAllowedExtension(providerId, session.account.label, extensionId, extensionName, true);
+				this.updateSessionPreference(providerId, extensionId, session);
 			}
 		});
 
@@ -697,10 +752,12 @@ export class AuthenticationService extends Disposable implements IAuthentication
 		}
 	}
 
-	async createSession(id: string, scopes: string[], activateImmediate: boolean = false): Promise<AuthenticationSession> {
-		const authProvider = this._authenticationProviders.get(id) || await this.tryActivateProvider(id, activateImmediate);
+	async createSession(id: string, scopes: string[], options?: IAuthenticationCreateSessionOptions): Promise<AuthenticationSession> {
+		const authProvider = this._authenticationProviders.get(id) || await this.tryActivateProvider(id, !!options?.activateImmediate);
 		if (authProvider) {
-			return await authProvider.createSession(scopes);
+			return await authProvider.createSession(scopes, {
+				sessionToRecreate: options?.sessionToRecreate
+			});
 		} else {
 			throw new Error(`No authentication provider '${id}' is currently registered.`);
 		}
@@ -717,21 +774,92 @@ export class AuthenticationService extends Disposable implements IAuthentication
 
 	async manageTrustedExtensionsForAccount(id: string, accountName: string): Promise<void> {
 		const authProvider = this._authenticationProviders.get(id);
-		if (authProvider) {
-			return authProvider.manageTrustedExtensions(accountName);
-		} else {
+		if (!authProvider) {
 			throw new Error(`No authentication provider '${id}' is currently registered.`);
 		}
+		const allowedExtensions = readAllowedExtensions(this.storageService, authProvider.id, accountName);
+
+		if (!allowedExtensions.length) {
+			this.dialogService.info(nls.localize('noTrustedExtensions', "This account has not been used by any extensions."));
+			return;
+		}
+
+		type TrustedExtensionsQuickPickItem = {
+			label: string;
+			description: string;
+			extension: AllowedExtension;
+		};
+		const quickPick = this.quickInputService.createQuickPick<TrustedExtensionsQuickPickItem>();
+		quickPick.canSelectMany = true;
+		quickPick.customButton = true;
+		quickPick.customLabel = nls.localize('manageTrustedExtensions.cancel', 'Cancel');
+		const usages = readAccountUsages(this.storageService, authProvider.id, accountName);
+		const items = allowedExtensions.map(extension => {
+			const usage = usages.find(usage => extension.id === usage.extensionId);
+			return {
+				label: extension.name,
+				description: usage
+					? nls.localize({ key: 'accountLastUsedDate', comment: ['The placeholder {0} is a string with time information, such as "3 days ago"'] }, "Last used this account {0}", fromNow(usage.lastUsed, true))
+					: nls.localize('notUsed', "Has not used this account"),
+				extension
+			};
+		});
+
+		quickPick.items = items;
+		quickPick.selectedItems = items.filter(item => item.extension.allowed === undefined || item.extension.allowed);
+		quickPick.title = nls.localize('manageTrustedExtensions', "Manage Trusted Extensions");
+		quickPick.placeholder = nls.localize('manageExtensions', "Choose which extensions can access this account");
+
+		quickPick.onDidAccept(() => {
+			const updatedAllowedList = quickPick.items.map(i => (i as TrustedExtensionsQuickPickItem).extension);
+			this.storageService.store(`${authProvider.id}-${accountName}`, JSON.stringify(updatedAllowedList), StorageScope.APPLICATION, StorageTarget.USER);
+			quickPick.dispose();
+		});
+
+		quickPick.onDidChangeSelection((changed) => {
+			quickPick.items.forEach(item => {
+				if ((item as TrustedExtensionsQuickPickItem).extension) {
+					(item as TrustedExtensionsQuickPickItem).extension.allowed = false;
+				}
+			});
+
+			changed.forEach((item) => item.extension.allowed = true);
+		});
+
+		quickPick.onDidHide(() => {
+			quickPick.dispose();
+		});
+
+		quickPick.onDidCustom(() => {
+			quickPick.hide();
+		});
+
+		quickPick.show();
 	}
 
 	async removeAccountSessions(id: string, accountName: string, sessions: AuthenticationSession[]): Promise<void> {
 		const authProvider = this._authenticationProviders.get(id);
-		if (authProvider) {
-			return authProvider.removeAccountSessions(accountName, sessions);
-		} else {
+		if (!authProvider) {
 			throw new Error(`No authentication provider '${id}' is currently registered.`);
+		}
+
+		const accountUsages = readAccountUsages(this.storageService, authProvider.id, accountName);
+
+		const { confirmed } = await this.dialogService.confirm({
+			type: Severity.Info,
+			message: accountUsages.length
+				? nls.localize('signOutMessage', "The account '{0}' has been used by: \n\n{1}\n\n Sign out from these extensions?", accountName, accountUsages.map(usage => usage.extensionName).join('\n'))
+				: nls.localize('signOutMessageSimple', "Sign out of '{0}'?", accountName),
+			primaryButton: nls.localize({ key: 'signOut', comment: ['&& denotes a mnemonic'] }, "&&Sign Out")
+		});
+
+		if (confirmed) {
+			const removeSessionPromises = sessions.map(session => authProvider.removeSession(session.id));
+			await Promise.all(removeSessionPromises);
+			removeAccountUsage(this.storageService, authProvider.id, accountName);
+			this.storageService.remove(`${authProvider.id}-${accountName}`, StorageScope.APPLICATION);
 		}
 	}
 }
 
-registerSingleton(IAuthenticationService, AuthenticationService);
+registerSingleton(IAuthenticationService, AuthenticationService, InstantiationType.Delayed);

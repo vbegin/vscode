@@ -1,8 +1,8 @@
+"use strict";
 /*---------------------------------------------------------------------------------------------
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
-'use strict';
 Object.defineProperty(exports, "__esModule", { value: true });
 const identity_1 = require("@azure/identity");
 const cosmos_1 = require("@azure/cosmos");
@@ -34,6 +34,7 @@ async function main() {
         timestamp: (new Date()).getTime(),
         version,
         isReleased: false,
+        private: process.env['VSCODE_PRIVATE_BUILD']?.toLowerCase() === 'true',
         sourceBranch,
         queuedBy,
         assets: [],
@@ -51,3 +52,4 @@ main().then(() => {
     console.error(err);
     process.exit(1);
 });
+//# sourceMappingURL=createBuild.js.map

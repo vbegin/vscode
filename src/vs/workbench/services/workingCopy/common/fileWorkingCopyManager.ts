@@ -11,9 +11,9 @@ import { CancellationToken } from 'vs/base/common/cancellation';
 import { Disposable } from 'vs/base/common/lifecycle';
 import { toLocalResource, joinPath, isEqual, basename, dirname } from 'vs/base/common/resources';
 import { URI } from 'vs/base/common/uri';
-import { IFileDialogService, IDialogService, IConfirmation } from 'vs/platform/dialogs/common/dialogs';
+import { IFileDialogService, IDialogService } from 'vs/platform/dialogs/common/dialogs';
 import { IFileService } from 'vs/platform/files/common/files';
-import { ISaveOptions } from 'vs/workbench/common/editor';
+import { ISaveOptions, SaveSourceRegistry } from 'vs/workbench/common/editor';
 import { IWorkbenchEnvironmentService } from 'vs/workbench/services/environment/common/environmentService';
 import { IPathService } from 'vs/workbench/services/path/common/pathService';
 import { IUriIdentityService } from 'vs/platform/uriIdentity/common/uriIdentity';
@@ -126,7 +126,7 @@ export interface IFileWorkingCopySaveAsOptions extends ISaveOptions {
 
 	/**
 	 * Optional target resource to suggest to the user in case
-	 * no taget resource is provided to save to.
+	 * no target resource is provided to save to.
 	 */
 	suggestedTarget?: URI;
 }
@@ -134,6 +134,9 @@ export interface IFileWorkingCopySaveAsOptions extends ISaveOptions {
 export class FileWorkingCopyManager<S extends IStoredFileWorkingCopyModel, U extends IUntitledFileWorkingCopyModel> extends Disposable implements IFileWorkingCopyManager<S, U> {
 
 	readonly onDidCreate: Event<IFileWorkingCopy<S | U>>;
+
+	private static readonly FILE_WORKING_COPY_SAVE_CREATE_SOURCE = SaveSourceRegistry.registerSource('fileWorkingCopyCreate.source', localize('fileWorkingCopyCreate.source', "File Created"));
+	private static readonly FILE_WORKING_COPY_SAVE_REPLACE_SOURCE = SaveSourceRegistry.registerSource('fileWorkingCopyReplace.source', localize('fileWorkingCopyReplace.source', "File Replaced"));
 
 	readonly stored: IStoredFileWorkingCopyManager<S>;
 	readonly untitled: IUntitledFileWorkingCopyManager<U>;
@@ -145,12 +148,12 @@ export class FileWorkingCopyManager<S extends IStoredFileWorkingCopyModel, U ext
 		@IFileService private readonly fileService: IFileService,
 		@ILifecycleService lifecycleService: ILifecycleService,
 		@ILabelService labelService: ILabelService,
-		@ILogService logService: ILogService,
+		@ILogService private readonly logService: ILogService,
 		@IWorkingCopyFileService private readonly workingCopyFileService: IWorkingCopyFileService,
 		@IWorkingCopyBackupService workingCopyBackupService: IWorkingCopyBackupService,
 		@IUriIdentityService private readonly uriIdentityService: IUriIdentityService,
 		@IFileDialogService private readonly fileDialogService: IFileDialogService,
-		@IFilesConfigurationService filesConfigurationService: IFilesConfigurationService,
+		@IFilesConfigurationService private readonly filesConfigurationService: IFilesConfigurationService,
 		@IWorkingCopyService workingCopyService: IWorkingCopyService,
 		@INotificationService notificationService: INotificationService,
 		@IWorkingCopyEditorService workingCopyEditorService: IWorkingCopyEditorService,
@@ -196,7 +199,7 @@ export class FileWorkingCopyManager<S extends IStoredFileWorkingCopyModel, U ext
 	private provideDecorations(): void {
 
 		// File working copy decorations
-		this.decorationsService.registerDecorationsProvider(new class extends Disposable implements IDecorationsProvider {
+		const provider = this._register(new class extends Disposable implements IDecorationsProvider {
 
 			readonly label = localize('fileWorkingCopyDecorations', "File Working Copy Decorations");
 
@@ -244,7 +247,7 @@ export class FileWorkingCopyManager<S extends IStoredFileWorkingCopyModel, U ext
 						color: listErrorForeground,
 						letter: Codicon.lockSmall,
 						strikethrough: true,
-						tooltip: localize('readonlyAndDeleted', "Deleted, Read Only"),
+						tooltip: localize('readonlyAndDeleted', "Deleted, Read-only"),
 					};
 				}
 
@@ -252,7 +255,7 @@ export class FileWorkingCopyManager<S extends IStoredFileWorkingCopyModel, U ext
 				else if (isReadonly) {
 					return {
 						letter: Codicon.lockSmall,
-						tooltip: localize('readonly', "Read Only"),
+						tooltip: localize('readonly', "Read-only"),
 					};
 				}
 
@@ -268,6 +271,8 @@ export class FileWorkingCopyManager<S extends IStoredFileWorkingCopyModel, U ext
 				return undefined;
 			}
 		}(this.stored));
+
+		this._register(this.decorationsService.registerDecorationsProvider(provider));
 	}
 
 	//#endregin
@@ -325,6 +330,16 @@ export class FileWorkingCopyManager<S extends IStoredFileWorkingCopyModel, U ext
 
 		if (!target) {
 			return; // user canceled
+		}
+
+		// Ensure target is not marked as readonly and prompt otherwise
+		if (this.filesConfigurationService.isReadonly(target)) {
+			const confirmed = await this.confirmMakeWriteable(target);
+			if (!confirmed) {
+				return;
+			} else {
+				this.filesConfigurationService.updateReadonly(target, false);
+			}
 		}
 
 		// Just save if target is same as working copies own resource
@@ -405,14 +420,36 @@ export class FileWorkingCopyManager<S extends IStoredFileWorkingCopyModel, U ext
 		// Take over content from source to target
 		await targetStoredFileWorkingCopy.model?.update(sourceContents, CancellationToken.None);
 
+		// Set source options depending on target exists or not
+		if (!options?.source) {
+			options = {
+				...options,
+				source: targetFileExists ? FileWorkingCopyManager.FILE_WORKING_COPY_SAVE_REPLACE_SOURCE : FileWorkingCopyManager.FILE_WORKING_COPY_SAVE_CREATE_SOURCE
+			};
+		}
+
 		// Save target
-		const success = await targetStoredFileWorkingCopy.save({ ...options, force: true  /* force to save, even if not dirty (https://github.com/microsoft/vscode/issues/99619) */ });
+		const success = await targetStoredFileWorkingCopy.save({
+			...options,
+			from: source,
+			force: true  /* force to save, even if not dirty (https://github.com/microsoft/vscode/issues/99619) */
+		});
 		if (!success) {
 			return undefined;
 		}
 
 		// Revert the source
-		await sourceWorkingCopy?.revert();
+		try {
+			await sourceWorkingCopy?.revert();
+		} catch (error) {
+
+			// It is possible that reverting the source fails, for example
+			// when a remote is disconnected and we cannot read it anymore.
+			// However, this should not interrupt the "Save As" flow, so
+			// we gracefully catch the error and just log it.
+
+			this.logService.error(error);
+		}
 
 		return targetStoredFileWorkingCopy;
 	}
@@ -454,15 +491,25 @@ export class FileWorkingCopyManager<S extends IStoredFileWorkingCopyModel, U ext
 	}
 
 	private async confirmOverwrite(resource: URI): Promise<boolean> {
-		const confirm: IConfirmation = {
+		const { confirmed } = await this.dialogService.confirm({
+			type: 'warning',
 			message: localize('confirmOverwrite', "'{0}' already exists. Do you want to replace it?", basename(resource)),
-			detail: localize('irreversible', "A file or folder with the name '{0}' already exists in the folder '{1}'. Replacing it will overwrite its current contents.", basename(resource), basename(dirname(resource))),
-			primaryButton: localize({ key: 'replaceButtonLabel', comment: ['&& denotes a mnemonic'] }, "&&Replace"),
-			type: 'warning'
-		};
+			detail: localize('overwriteIrreversible', "A file or folder with the name '{0}' already exists in the folder '{1}'. Replacing it will overwrite its current contents.", basename(resource), basename(dirname(resource))),
+			primaryButton: localize({ key: 'replaceButtonLabel', comment: ['&& denotes a mnemonic'] }, "&&Replace")
+		});
 
-		const result = await this.dialogService.confirm(confirm);
-		return result.confirmed;
+		return confirmed;
+	}
+
+	private async confirmMakeWriteable(resource: URI): Promise<boolean> {
+		const { confirmed } = await this.dialogService.confirm({
+			type: 'warning',
+			message: localize('confirmMakeWriteable', "'{0}' is marked as read-only. Do you want to save anyway?", basename(resource)),
+			detail: localize('confirmMakeWriteableDetail', "Paths can be configured as read-only via settings."),
+			primaryButton: localize({ key: 'makeWriteableButtonLabel', comment: ['&& denotes a mnemonic'] }, "&&Save Anyway")
+		});
+
+		return confirmed;
 	}
 
 	private async suggestSavePath(resource: URI): Promise<URI> {
@@ -483,7 +530,7 @@ export class FileWorkingCopyManager<S extends IStoredFileWorkingCopyModel, U ext
 		// 3.) Pick the working copy name if valid joined with default path
 		if (workingCopy) {
 			const candidatePath = joinPath(defaultFilePath, workingCopy.name);
-			if (await this.pathService.hasValidBasename(candidatePath)) {
+			if (await this.pathService.hasValidBasename(candidatePath, workingCopy.name)) {
 				return candidatePath;
 			}
 		}
