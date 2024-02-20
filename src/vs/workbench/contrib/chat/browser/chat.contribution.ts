@@ -3,10 +3,9 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { Disposable, DisposableStore } from 'vs/base/common/lifecycle';
+import { Disposable } from 'vs/base/common/lifecycle';
 import { Schemas } from 'vs/base/common/network';
 import { isMacintosh } from 'vs/base/common/platform';
-import { Emitter } from 'vs/base/common/event';
 import * as nls from 'vs/nls';
 import { Extensions as ConfigurationExtensions, IConfigurationRegistry } from 'vs/platform/configuration/common/configurationRegistry';
 import { SyncDescriptor } from 'vs/platform/instantiation/common/descriptors';
@@ -31,7 +30,7 @@ import { ChatWidgetService } from 'vs/workbench/contrib/chat/browser/chatWidget'
 import 'vs/workbench/contrib/chat/browser/contrib/chatInputEditorContrib';
 import 'vs/workbench/contrib/chat/browser/contrib/chatHistoryVariables';
 import { IChatContributionService } from 'vs/workbench/contrib/chat/common/chatContributionService';
-import { CHAT_FEATURE_ID, IChatService } from 'vs/workbench/contrib/chat/common/chatService';
+import { IChatService } from 'vs/workbench/contrib/chat/common/chatService';
 import { ChatService } from 'vs/workbench/contrib/chat/common/chatServiceImpl';
 import { ChatWidgetHistoryService, IChatWidgetHistoryService } from 'vs/workbench/contrib/chat/common/chatWidgetHistoryService';
 import { IEditorResolverService, RegisteredEditorPriority } from 'vs/workbench/services/editor/common/editorResolverService';
@@ -57,11 +56,9 @@ import { registerChatFileTreeActions } from 'vs/workbench/contrib/chat/browser/a
 import { QuickChatService } from 'vs/workbench/contrib/chat/browser/chatQuick';
 import { ChatAgentService, IChatAgentService } from 'vs/workbench/contrib/chat/common/chatAgents';
 import { ChatVariablesService } from 'vs/workbench/contrib/chat/browser/chatVariables';
-import { chatAgentLeader, chatSubcommandLeader } from 'vs/workbench/contrib/chat/common/chatParserTypes';
+import { chatAgentLeader, chatSubcommandLeader, chatVariableLeader } from 'vs/workbench/contrib/chat/common/chatParserTypes';
 import { CancellationToken } from 'vs/base/common/cancellation';
-import { IExtensionFeatureMarkdownRenderer, Extensions as ExtensionFeaturesExtensions, IRenderedData, IExtensionFeaturesRegistry, IExtensionFeaturesManagementService } from 'vs/workbench/services/extensionManagement/common/extensionFeatures';
-import { ExtensionIdentifier, IExtensionManifest } from 'vs/platform/extensions/common/extensions';
-import { getExtensionId } from 'vs/platform/extensionManagement/common/extensionManagementUtil';
+import { IVoiceChatService, VoiceChatService } from 'vs/workbench/contrib/chat/common/voiceChat';
 
 // Register configuration
 const configurationRegistry = Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration);
@@ -198,7 +195,7 @@ class ChatAccessibleViewContribution extends Disposable {
 				accessibleViewService.show({
 					id: AccessibleViewProviderId.Chat,
 					verbositySettingKey: AccessibilityVerbositySettingId.Chat,
-					provideContent(): string { return responseContent; },
+					provideContent(): string { return responseContent!; },
 					onClose() {
 						verifiedWidget.reveal(focusedItem);
 						if (chatInputFocused) {
@@ -231,12 +228,13 @@ class ChatSlashStaticSlashCommandsContribution extends Disposable {
 		@IChatSlashCommandService slashCommandService: IChatSlashCommandService,
 		@ICommandService commandService: ICommandService,
 		@IChatAgentService chatAgentService: IChatAgentService,
+		@IChatVariablesService chatVariablesService: IChatVariablesService,
 	) {
 		super();
 		this._store.add(slashCommandService.registerSlashCommand({
-			command: 'newChat',
-			detail: nls.localize('newChat', "Start a new chat"),
-			sortText: 'z2_newChat',
+			command: 'clear',
+			detail: nls.localize('clear', "Start a new chat"),
+			sortText: 'z2_clear',
 			executeImmediately: true
 		}, async () => {
 			commandService.executeCommand(ACTION_ID_NEW_CHAT);
@@ -249,6 +247,8 @@ class ChatSlashStaticSlashCommandsContribution extends Disposable {
 		}, async (prompt, progress) => {
 			const defaultAgent = chatAgentService.getDefaultAgent();
 			const agents = chatAgentService.getAgents();
+
+			// Report prefix
 			if (defaultAgent?.metadata.helpTextPrefix) {
 				if (isMarkdownString(defaultAgent.metadata.helpTextPrefix)) {
 					progress.report({ content: defaultAgent.metadata.helpTextPrefix, kind: 'markdownContent' });
@@ -258,6 +258,7 @@ class ChatSlashStaticSlashCommandsContribution extends Disposable {
 				progress.report({ content: '\n\n', kind: 'content' });
 			}
 
+			// Report agent list
 			const agentText = (await Promise.all(agents
 				.filter(a => a.id !== defaultAgent?.id)
 				.map(async a => {
@@ -275,6 +276,23 @@ class ChatSlashStaticSlashCommandsContribution extends Disposable {
 					return (agentLine + '\n' + commandText).trim();
 				}))).join('\n');
 			progress.report({ content: new MarkdownString(agentText, { isTrusted: { enabledCommands: [SubmitAction.ID] } }), kind: 'markdownContent' });
+
+			// Report variables
+			if (defaultAgent?.metadata.helpTextVariablesPrefix) {
+				progress.report({ content: '\n\n', kind: 'content' });
+				if (isMarkdownString(defaultAgent.metadata.helpTextVariablesPrefix)) {
+					progress.report({ content: defaultAgent.metadata.helpTextVariablesPrefix, kind: 'markdownContent' });
+				} else {
+					progress.report({ content: defaultAgent.metadata.helpTextVariablesPrefix, kind: 'content' });
+				}
+
+				const variableText = Array.from(chatVariablesService.getVariables())
+					.map(v => `* \`${chatVariableLeader}${v.name}\` - ${v.description}`)
+					.join('\n');
+				progress.report({ content: '\n' + variableText, kind: 'content' });
+			}
+
+			// Report help text ending
 			if (defaultAgent?.metadata.helpTextPostfix) {
 				progress.report({ content: '\n\n', kind: 'content' });
 				if (isMarkdownString(defaultAgent.metadata.helpTextPostfix)) {
@@ -286,62 +304,6 @@ class ChatSlashStaticSlashCommandsContribution extends Disposable {
 		}));
 	}
 }
-
-class ChatFeatureMarkdowneRenderer extends Disposable implements IExtensionFeatureMarkdownRenderer {
-
-	readonly type = 'markdown';
-
-	constructor(
-		@IExtensionFeaturesManagementService private readonly extensionFeaturesManagementService: IExtensionFeaturesManagementService,
-	) {
-		super();
-	}
-
-	shouldRender(manifest: IExtensionManifest): boolean {
-		const extensionId = new ExtensionIdentifier(getExtensionId(manifest.publisher, manifest.name));
-		const accessData = this.extensionFeaturesManagementService.getAccessData(extensionId, CHAT_FEATURE_ID);
-		return !!accessData;
-	}
-
-	render(manifest: IExtensionManifest): IRenderedData<IMarkdownString> {
-		const disposables = new DisposableStore();
-		const emitter = disposables.add(new Emitter<IMarkdownString>());
-		const extensionId = new ExtensionIdentifier(getExtensionId(manifest.publisher, manifest.name));
-		disposables.add(this.extensionFeaturesManagementService.onDidChangeAccessData(e => {
-			if (ExtensionIdentifier.equals(e.extension, extensionId) && e.featureId === CHAT_FEATURE_ID) {
-				emitter.fire(this.getMarkdownData(extensionId));
-			}
-		}));
-		return {
-			data: this.getMarkdownData(extensionId),
-			onDidChange: emitter.event,
-			dispose: () => { disposables.dispose(); }
-		};
-	}
-
-	private getMarkdownData(extensionId: ExtensionIdentifier): IMarkdownString {
-		const markdown = new MarkdownString();
-		const accessData = this.extensionFeaturesManagementService.getAccessData(extensionId, CHAT_FEATURE_ID);
-		if (accessData && accessData.totalCount) {
-			if (accessData.current) {
-				markdown.appendMarkdown(nls.localize('requests count session', "Requests (Session) : `{0}`", accessData.current.count));
-				markdown.appendText('\n');
-			}
-			markdown.appendMarkdown(nls.localize('requests count total', "Requests (Overall): `{0}`", accessData.totalCount));
-		}
-		return markdown;
-	}
-}
-
-Registry.as<IExtensionFeaturesRegistry>(ExtensionFeaturesExtensions.ExtensionFeaturesRegistry).registerExtensionFeature({
-	id: CHAT_FEATURE_ID,
-	label: nls.localize('chat', "Chat"),
-	description: nls.localize('chatFeatureDescription', "Allows the extension to make requests to the Large Language Model (LLM)."),
-	access: {
-		canToggle: false,
-	},
-	renderer: new SyncDescriptor(ChatFeatureMarkdowneRenderer),
-});
 
 const workbenchContributionsRegistry = Registry.as<IWorkbenchContributionsRegistry>(WorkbenchExtensions.Workbench);
 registerWorkbenchContribution2(ChatResolverContribution.ID, ChatResolverContribution, WorkbenchPhase.BlockStartup);
@@ -370,3 +332,4 @@ registerSingleton(IChatProviderService, ChatProviderService, InstantiationType.D
 registerSingleton(IChatSlashCommandService, ChatSlashCommandService, InstantiationType.Delayed);
 registerSingleton(IChatAgentService, ChatAgentService, InstantiationType.Delayed);
 registerSingleton(IChatVariablesService, ChatVariablesService, InstantiationType.Delayed);
+registerSingleton(IVoiceChatService, VoiceChatService, InstantiationType.Delayed);
